@@ -12,6 +12,9 @@ import (
 	"net/http/httputil"
 	_ "net/http/pprof"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -35,10 +38,32 @@ var serverResultFileName = "server.txt"
 var clientResultFileName = "client.txt"
 var dockerNetWorkName = "test"
 var network = "172.18.0.0/16"
-var fileSavePath = "/usr/src/myapp/"
+var fileSavePath = filepath.Join(os.TempDir(), "nps_mux_integration") + string(os.PathSeparator)
 var dataSize = 1024 * 1024 * 100
 
+func requireIntegrationEnv(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skipf("integration test skipped: requires linux, current GOOS=%s", runtime.GOOS)
+	}
+	if os.Getenv("NPS_RUN_INTEGRATION_TESTS") != "1" {
+		t.Skip("integration test skipped: set NPS_RUN_INTEGRATION_TESTS=1 to enable")
+	}
+	for _, tool := range []string{"docker", "tc"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("integration test skipped: missing required tool %q", tool)
+		}
+	}
+	if err := os.MkdirAll(fileSavePath, 0o755); err != nil {
+		t.Fatalf("failed to create integration result directory: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(fileSavePath)
+	})
+}
+
 func TestMux(t *testing.T) {
+	requireIntegrationEnv(t)
 	pwd, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +96,7 @@ func writeResult(values []float64, outfile string) error {
 		fmt.Println("writer", err)
 		return err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	writer := bufio.NewWriter(file)
 	for _, v := range values {
 		_, _ = writer.WriteString(fmt.Sprintf("%.2f", v))
@@ -87,7 +112,7 @@ func appendResult(values []float64, outfile string) error {
 		fmt.Println("writer", err)
 		return err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	writer := bufio.NewWriter(file)
 	for _, v := range values {
 		_, _ = writer.WriteString(fmt.Sprintf("%.2f", v))
@@ -98,6 +123,7 @@ func appendResult(values []float64, outfile string) error {
 }
 
 func TestServer(t *testing.T) {
+	requireIntegrationEnv(t)
 	tc, err := NewTrafficControl(serverIp)
 	if err != nil {
 		t.Fatal(err, tc)
@@ -116,7 +142,7 @@ func TestServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer clientBridgeConn.Close()
+	defer func() { _ = clientBridgeConn.Close() }()
 	// new mux
 	mux := NewMux(clientBridgeConn, "tcp", 60, true)
 	// start server port
@@ -124,7 +150,7 @@ func TestServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer serverListener.Close()
+	defer func() { _ = serverListener.Close() }()
 	for {
 		// accept user connection
 		userConn, err := serverListener.Accept()
@@ -138,7 +164,7 @@ func TestServer(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			go io.Copy(userConn, clientConn)
+			go func() { _, _ = io.Copy(userConn, clientConn) }()
 			go func() {
 				_ = writeResult([]float64{
 					mux.bw.Get() / 1024 / 1024,
@@ -162,6 +188,7 @@ func TestServer(t *testing.T) {
 	}
 }
 func TestClient(t *testing.T) {
+	requireIntegrationEnv(t)
 	tc, err := NewTrafficControl(clientIp)
 	if err != nil {
 		t.Fatal(err, tc)
@@ -189,9 +216,9 @@ func TestClient(t *testing.T) {
 				t.Error()
 				return
 			}
-			defer appConn.Close()
-			defer userConn.Close()
-			go io.Copy(userConn, appConn)
+			defer func() { _ = appConn.Close() }()
+			defer func() { _ = userConn.Close() }()
+			go func() { _, _ = io.Copy(userConn, appConn) }()
 			go func() {
 				_ = writeResult([]float64{
 					mux.bw.Get() / 1024 / 1024,
@@ -214,6 +241,7 @@ func TestClient(t *testing.T) {
 	}
 }
 func TestApp(t *testing.T) {
+	requireIntegrationEnv(t)
 	tc, err := NewTrafficControl(appIp)
 	if err != nil {
 		t.Fatal(err, tc)
@@ -281,6 +309,7 @@ func TestApp(t *testing.T) {
 	}
 }
 func TestUser(t *testing.T) {
+	requireIntegrationEnv(t)
 	tc, err := NewTrafficControl(userIp)
 	if err != nil {
 		t.Fatal(err, tc)
@@ -338,6 +367,7 @@ func TestUser(t *testing.T) {
 	}
 }
 func TestNewMux2(t *testing.T) {
+	requireIntegrationEnv(t)
 	tc, err := NewTrafficControl("")
 	if err != nil {
 		t.Fatal(err)
@@ -389,6 +419,7 @@ func TestNewMux2(t *testing.T) {
 	log.Println(err)
 }
 func TestNewMux(t *testing.T) {
+	t.Skip("manual long-running test; not suitable for automated unit test runs")
 	go func() {
 		_ = http.ListenAndServe("0.0.0.0:8889", nil)
 	}()
@@ -601,24 +632,33 @@ func TestNewConn(t *testing.T) {
 func TestDQueue(t *testing.T) {
 	d := new(bufDequeue)
 	d.vals = make([]unsafe.Pointer, 8)
-	go func() {
-		time.Sleep(time.Second)
-		for i := 0; i < 10; i++ {
-			log.Println(i)
-			log.Println(d.popTail())
+
+	values := []string{"test-1", "test-2", "test-3"}
+	for i := range values {
+		v := values[i]
+		if ok := d.pushHead(unsafe.Pointer(&v)); !ok {
+			t.Fatalf("pushHead(%d) failed", i)
 		}
-	}()
-	go func() {
-		time.Sleep(time.Second)
-		for i := 0; i < 10; i++ {
-			data := "test"
-			go log.Println(i, unsafe.Pointer(&data), d.pushHead(unsafe.Pointer(&data)))
+	}
+
+	for i, want := range values {
+		raw, ok := d.popTail()
+		if !ok {
+			t.Fatalf("popTail(%d) reported empty queue", i)
 		}
-	}()
-	time.Sleep(time.Second * 3)
+		got := *(*string)(raw)
+		if got != want {
+			t.Fatalf("popTail(%d) = %q, want %q", i, got, want)
+		}
+	}
+
+	if _, ok := d.popTail(); ok {
+		t.Fatal("popTail() should report empty queue after consuming all values")
+	}
 }
 
 func TestChain(t *testing.T) {
+	t.Skip("stress/manual test; not suitable for automated unit test runs")
 	go func() {
 		log.Println(http.ListenAndServe("0.0.0.0:8889", nil))
 	}()

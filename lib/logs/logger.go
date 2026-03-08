@@ -25,9 +25,11 @@ var (
 const defaultBufSize = 64 * 1024 // 64KB
 
 type BufferWriter struct {
-	mu  sync.Mutex
-	buf *bytes.Buffer
-	cap int
+	mu    sync.Mutex
+	buf   []byte
+	cap   int
+	start int
+	size  int
 }
 
 func NewBufferWriter(capacity int) *BufferWriter {
@@ -35,7 +37,7 @@ func NewBufferWriter(capacity int) *BufferWriter {
 		capacity = defaultBufSize
 	}
 	return &BufferWriter{
-		buf: bytes.NewBuffer(make([]byte, 0, capacity)),
+		buf: make([]byte, capacity),
 		cap: capacity,
 	}
 }
@@ -44,21 +46,47 @@ func (w *BufferWriter) Write(p []byte) (n int, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.buf.Len()+len(p) > w.cap {
-		drop := w.buf.Len() + len(p) - w.cap
-		data := w.buf.Bytes()
-		w.buf.Reset()
-		w.buf.Write(data[drop:])
+	if len(p) >= w.cap {
+		copy(w.buf, p[len(p)-w.cap:])
+		w.start = 0
+		w.size = w.cap
+		return len(p), nil
 	}
-	w.buf.Write(p)
+
+	if w.size+len(p) > w.cap {
+		drop := w.size + len(p) - w.cap
+		w.start = (w.start + drop) % w.cap
+		w.size -= drop
+	}
+
+	writePos := (w.start + w.size) % w.cap
+	written := copy(w.buf[writePos:], p)
+	if written < len(p) {
+		copy(w.buf, p[written:])
+	}
+	w.size += len(p)
 	return len(p), nil
 }
 
 func (w *BufferWriter) GetAndClear() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	s := w.buf.String()
-	w.buf.Reset()
+	if w.size == 0 {
+		return ""
+	}
+
+	var s string
+	if w.start+w.size <= w.cap {
+		s = string(w.buf[w.start : w.start+w.size])
+	} else {
+		tmp := make([]byte, w.size)
+		n := copy(tmp, w.buf[w.start:])
+		copy(tmp[n:], w.buf[:w.size-n])
+		s = string(tmp)
+	}
+
+	w.start = 0
+	w.size = 0
 	return s
 }
 
@@ -213,29 +241,43 @@ func SetLevel(levelStr string) {
 
 type zapAdapter struct{}
 
+var (
+	lineEndingBytes  = []byte(zapcore.DefaultLineEnding)
+	debugLevelBytes  = []byte("DEBUG")
+	infoLevelBytes   = []byte("INFO")
+	warnLevelBytes   = []byte("WARN")
+	warningBytes     = []byte("WARNING")
+	errorLevelBytes  = []byte("ERROR")
+	dpanicLevelBytes = []byte("DPANIC")
+	panicLevelBytes  = []byte("PANIC")
+	fatalLevelBytes  = []byte("FATAL")
+)
+
 func (zapAdapter) Write(p []byte) (n int, err error) {
-	s := strings.TrimSuffix(string(p), zapcore.DefaultLineEnding)
-	parts := strings.SplitN(s, "\t", 2)
-	levelStr, msg := "INFO", s
-	if len(parts) == 2 {
-		levelStr = parts[0]
-		msg = parts[1]
+	line := bytes.TrimSuffix(p, lineEndingBytes)
+	level := infoLevelBytes
+	msg := line
+	if i := bytes.IndexByte(line, '\t'); i >= 0 {
+		level = line[:i]
+		msg = line[i+1:]
 	}
-	switch levelStr {
-	case "DEBUG":
-		Logger.Debug().Msg(msg)
-	case "INFO":
-		Logger.Info().Msg(msg)
-	case "WARN", "WARNING":
-		Logger.Warn().Msg(msg)
-	case "ERROR":
-		Logger.Error().Msg(msg)
-	case "DPANIC", "PANIC":
-		Logger.Panic().Msg(msg)
-	case "FATAL":
-		Logger.Fatal().Msg(msg)
+
+	msgStr := string(msg)
+	switch {
+	case bytes.Equal(level, debugLevelBytes):
+		Logger.Debug().Msg(msgStr)
+	case bytes.Equal(level, infoLevelBytes):
+		Logger.Info().Msg(msgStr)
+	case bytes.Equal(level, warnLevelBytes), bytes.Equal(level, warningBytes):
+		Logger.Warn().Msg(msgStr)
+	case bytes.Equal(level, errorLevelBytes):
+		Logger.Error().Msg(msgStr)
+	case bytes.Equal(level, dpanicLevelBytes), bytes.Equal(level, panicLevelBytes):
+		Logger.Panic().Msg(msgStr)
+	case bytes.Equal(level, fatalLevelBytes):
+		Logger.Fatal().Msg(msgStr)
 	default:
-		Logger.Info().Msg(msg)
+		Logger.Info().Msg(msgStr)
 	}
 	return len(p), nil
 }

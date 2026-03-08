@@ -25,6 +25,7 @@ import (
 )
 
 var LocalTCPAddr = &net.TCPAddr{IP: net.ParseIP("127.0.0.1")}
+var requestEndBytes = []byte("\r\n\r\n")
 
 type Conn struct {
 	Conn       net.Conn
@@ -39,7 +40,6 @@ type Conn struct {
 func NewConn(conn net.Conn) *Conn {
 	return &Conn{
 		Conn: conn,
-		wBuf: new(bytes.Buffer),
 	}
 }
 
@@ -71,7 +71,7 @@ func (s *Conn) readRequest(buf []byte) (n int, err error) {
 		if n < 4 {
 			continue
 		}
-		if string(buf[n-4:n]) == "\r\n\r\n" {
+		if bytes.Equal(buf[n-4:n], requestEndBytes) {
 			return
 		}
 		// buf is full, can't contain the request
@@ -101,13 +101,13 @@ func (s *Conn) GetHost() (method, address string, rb []byte, err error, r *http.
 		return
 	}
 	if hostPortURL.Opaque == "443" {
-		if strings.Index(r.Host, ":") == -1 {
+		if !strings.Contains(r.Host, ":") {
 			address = r.Host + ":443"
 		} else {
 			address = r.Host
 		}
 	} else {
-		if strings.Index(r.Host, ":") == -1 {
+		if !strings.Contains(r.Host, ":") {
 			address = r.Host + ":80"
 		} else {
 			address = r.Host
@@ -162,8 +162,9 @@ func (s *Conn) WriteLenContent(buf []byte) (err error) {
 
 // ReadFlag read flag
 func (s *Conn) ReadFlag() (string, error) {
-	buf := make([]byte, 4)
-	return string(buf), binary.Read(s, binary.LittleEndian, &buf)
+	var buf [4]byte
+	_, err := io.ReadFull(s, buf[:])
+	return string(buf[:]), err
 }
 
 // SetAlive set alive
@@ -214,8 +215,8 @@ func (s *Conn) GetLinkInfo() (lk *Link, err error) {
 
 // SendHealthInfo send info for link
 func (s *Conn) SendHealthInfo(info, status string) (int, error) {
-	raw := bytes.NewBuffer([]byte{})
-	common.BinaryWrite(raw, info, status)
+	var raw bytes.Buffer
+	common.BinaryWrite(&raw, info, status)
 	return s.Write(raw.Bytes())
 }
 
@@ -347,7 +348,7 @@ func (s *Conn) Write(b []byte) (n int, err error) {
 	}
 
 	s.mu.Lock()
-	if s.wBuf.Len() == 0 {
+	if s.wBuf == nil || s.wBuf.Len() == 0 {
 		s.mu.Unlock()
 		return s.Conn.Write(b)
 	}
@@ -369,6 +370,9 @@ func (s *Conn) BufferWrite(b []byte) (int, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.wBuf == nil {
+		s.wBuf = new(bytes.Buffer)
+	}
 	return s.wBuf.Write(b)
 }
 
@@ -378,7 +382,7 @@ func (s *Conn) FlushBuf() error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.wBuf.Len() == 0 {
+	if s.wBuf == nil || s.wBuf.Len() == 0 {
 		return nil
 	}
 	_, err := s.Conn.Write(s.wBuf.Bytes())
@@ -445,7 +449,7 @@ func (s *Conn) WriteAddOk() error {
 }
 
 func (s *Conn) WriteAddFail() error {
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	return binary.Write(s, binary.LittleEndian, false)
 }
 

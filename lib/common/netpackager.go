@@ -1,7 +1,6 @@
 package common
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -176,29 +175,31 @@ func ReadUDPDatagram(r io.Reader) (*UDPDatagram, error) {
 	}
 
 	dlen := int(header.Rsv)
-	if dlen == 0 {
-		// standard SOCKS5 UDP datagram: read the rest (we assume r is bounded, e.g., framed)
-		extra, err := io.ReadAll(r)
-		if err != nil {
+	if hlen > n {
+		if _, err := io.ReadFull(r, b[n:hlen]); err != nil {
 			return nil, err
 		}
-		copy(b[n:], extra)
-		n += len(extra) // total length
-		dlen = n - hlen // payload length
-	} else {
-		// extended feature: RSV carries data length
-		if _, err := io.ReadFull(r, b[n:hlen+dlen]); err != nil {
-			return nil, err
-		}
-		n = hlen + dlen
+		n = hlen
 	}
 
 	header.Addr = new(Addr)
 	if err := header.Addr.Decode(b[3:hlen]); err != nil {
 		return nil, err
 	}
-	data := make([]byte, dlen)
-	copy(data, b[hlen:n])
+	var data []byte
+	if dlen == 0 {
+		// standard SOCKS5 UDP datagram: read the rest (we assume r is bounded, e.g., framed)
+		data, err = io.ReadAll(r)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// extended feature: RSV carries data length
+		data = make([]byte, dlen)
+		if _, err := io.ReadFull(r, data); err != nil {
+			return nil, err
+		}
+	}
 	d := &UDPDatagram{
 		Header: header,
 		Data:   data,
@@ -218,16 +219,42 @@ func (d *UDPDatagram) Write(w io.Writer) error {
 	if h == nil {
 		h = &UDPHeader{}
 	}
-	buf := bytes.Buffer{}
-	if err := h.Write(&buf); err != nil {
-		return err
+
+	b := BufPoolUdp.Get().([]byte)
+	defer BufPoolUdp.Put(b)
+
+	binary.BigEndian.PutUint16(b[:2], h.Rsv)
+	b[2] = h.Frag
+
+	addr := h.Addr
+	if addr == nil {
+		addr = &Addr{}
 	}
-	if _, err := buf.Write(d.Data); err != nil {
-		return err
+	headerLen, _ := addr.Encode(b[3:])
+	headerLen += 3
+	total := headerLen + len(d.Data)
+
+	var packet []byte
+	if total <= len(b) {
+		packet = b[:total]
+	} else {
+		packet = make([]byte, total)
+		copy(packet[:headerLen], b[:headerLen])
 	}
 
-	_, err := buf.WriteTo(w)
-	return err
+	copy(packet[headerLen:], d.Data)
+
+	for len(packet) > 0 {
+		n, err := w.Write(packet)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		packet = packet[n:]
+	}
+	return nil
 }
 
 // trim IPv6 zone if any (e.g., "fe80::1%eth0" -> "fe80::1")

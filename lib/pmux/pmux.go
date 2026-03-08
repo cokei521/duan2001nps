@@ -10,7 +10,6 @@ import (
 	"net"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/djylb/nps/lib/common"
@@ -77,8 +76,9 @@ func (pMux *PortMux) Start() error {
 			conn, err := pMux.Listener.Accept()
 			if err != nil {
 				logs.Warn("%v", err)
-				//close
+				// close and stop processing when listener is no longer available.
 				_ = pMux.Close()
+				return
 			}
 			go pMux.process(conn)
 		}
@@ -87,6 +87,9 @@ func (pMux *PortMux) Start() error {
 }
 
 func (pMux *PortMux) process(conn net.Conn) {
+	if conn == nil {
+		return
+	}
 	// Recognition according to different signs
 	// read 3 byte
 	buf := make([]byte, 3)
@@ -121,16 +124,12 @@ func (pMux *PortMux) process(conn net.Conn) {
 					break
 				}
 				buffer.Write(b)
-				buffer.Write([]byte("\r\n"))
-				if strings.Index(string(b), "Host:") == 0 || strings.Index(string(b), "host:") == 0 {
-					// Remove host and space effects
-					str := strings.Replace(string(b), "Host:", "", -1)
-					str = strings.Replace(str, "host:", "", -1)
-					str = strings.TrimSpace(str)
+				buffer.WriteString("\r\n")
+				if host, ok := parseHostHeader(b); ok {
 					// Determine whether it is the same as the manager domain name
-					if common.GetIpByAddr(str) == pMux.managerHost && pMux.managerConn != nil {
+					if common.GetIpByAddr(host) == pMux.managerHost && pMux.managerConn != nil {
 						ch = pMux.managerConn
-					} else if common.GetIpByAddr(str) == pMux.clientHost && pMux.clientWsConn != nil {
+					} else if common.GetIpByAddr(host) == pMux.clientHost && pMux.clientWsConn != nil {
 						ch = pMux.clientWsConn
 					} else if pMux.httpConn != nil {
 						ch = pMux.httpConn
@@ -201,12 +200,39 @@ func (pMux *PortMux) Close() error {
 		return errors.New("the port pmux has closed")
 	}
 	pMux.isClose = true
-	close(pMux.clientConn)
-	close(pMux.clientTlsConn)
-	close(pMux.httpsConn)
-	close(pMux.httpConn)
-	close(pMux.managerConn)
-	return pMux.Listener.Close()
+	if pMux.clientConn != nil {
+		close(pMux.clientConn)
+	}
+	if pMux.clientTlsConn != nil {
+		close(pMux.clientTlsConn)
+	}
+	if pMux.clientWsConn != nil {
+		close(pMux.clientWsConn)
+	}
+	if pMux.clientWssConn != nil {
+		close(pMux.clientWssConn)
+	}
+	if pMux.httpsConn != nil {
+		close(pMux.httpsConn)
+	}
+	if pMux.httpConn != nil {
+		close(pMux.httpConn)
+	}
+	if pMux.managerConn != nil {
+		close(pMux.managerConn)
+	}
+	if pMux.Listener != nil {
+		return pMux.Listener.Close()
+	}
+	return nil
+}
+
+func parseHostHeader(line []byte) (string, bool) {
+	const header = "host:"
+	if len(line) < len(header) || !bytes.EqualFold(line[:len(header)], []byte(header)) {
+		return "", false
+	}
+	return string(bytes.TrimSpace(line[len(header):])), true
 }
 
 func (pMux *PortMux) GetClientListener() net.Listener {

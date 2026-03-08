@@ -92,10 +92,7 @@ func GetIpByAddr(host string) string {
 }
 
 func IsDomain(s string) bool {
-	if net.ParseIP(s) != nil {
-		return false
-	}
-	return true
+	return net.ParseIP(s) == nil
 }
 
 // GetPortByAddr
@@ -149,9 +146,9 @@ func ValidateAddr(s string) string {
 
 func BuildAddress(host string, port string) string {
 	if strings.Contains(host, ":") { // IPv6
-		return fmt.Sprintf("[%s]:%s", host, port)
+		return "[" + host + "]:" + port
 	}
-	return fmt.Sprintf("%s:%s", host, port)
+	return host + ":" + port
 }
 
 func SplitServerAndPath(s string) (server, path string) {
@@ -244,8 +241,8 @@ func GetPort(value int) int {
 // accountMap enable multi user auth
 func CheckAuthWithAccountMap(u, p, user, passwd string, accountMap, authMap map[string]string) bool {
 	// Single account check
-	noAccountMap := accountMap == nil || len(accountMap) == 0
-	noAuthMap := authMap == nil || len(authMap) == 0
+	noAccountMap := len(accountMap) == 0
+	noAuthMap := len(authMap) == 0
 	if noAccountMap && noAuthMap {
 		return u == user && p == passwd
 	}
@@ -277,7 +274,7 @@ func CheckAuthWithAccountMap(u, p, user, passwd string, accountMap, authMap map[
 // CheckAuth Check if the Request request is validated
 func CheckAuth(r *http.Request, user, passwd string, accountMap, authMap map[string]string) bool {
 	// Bypass authentication only if user, passwd are empty and multiAccount is nil or empty
-	if user == "" && passwd == "" && (accountMap == nil || len(accountMap) == 0) && (authMap == nil || len(authMap) == 0) {
+	if user == "" && passwd == "" && len(accountMap) == 0 && len(authMap) == 0 {
 		return true
 	}
 
@@ -386,7 +383,7 @@ func ReadAllFromFile(filePath string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return io.ReadAll(f)
 }
 
@@ -478,10 +475,7 @@ func TestTcpPort(port int) bool {
 			_ = l.Close()
 		}
 	}()
-	if err != nil {
-		return false
-	}
-	return true
+	return err == nil
 }
 
 // TestUdpPort Judge whether the UDP port can open normally
@@ -492,10 +486,7 @@ func TestUdpPort(port int) bool {
 			_ = l.Close()
 		}
 	}()
-	if err != nil {
-		return false
-	}
-	return true
+	return err == nil
 }
 
 // BinaryWrite Write length and individual byte data
@@ -503,20 +494,27 @@ func TestUdpPort(port int) bool {
 // # Characters are used to separate data
 func BinaryWrite(raw *bytes.Buffer, v ...string) {
 	b := GetWriteStr(v...)
-	_ = binary.Write(raw, binary.LittleEndian, int32(len(b)))
-	_ = binary.Write(raw, binary.LittleEndian, b)
+	var lenBuf [4]byte
+	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(b)))
+	_, _ = raw.Write(lenBuf[:])
+	_, _ = raw.Write(b)
 }
 
 // GetWriteStr get seq str
 func GetWriteStr(v ...string) []byte {
-	buffer := new(bytes.Buffer)
-	var l int32
-	for _, v := range v {
-		l += int32(len([]byte(v))) + int32(len([]byte(CONN_DATA_SEQ)))
-		_ = binary.Write(buffer, binary.LittleEndian, []byte(v))
-		_ = binary.Write(buffer, binary.LittleEndian, []byte(CONN_DATA_SEQ))
+	sep := CONN_DATA_SEQ
+	sepLen := len(sep)
+	total := 0
+	for _, s := range v {
+		total += len(s) + sepLen
 	}
-	return buffer.Bytes()
+
+	buffer := make([]byte, 0, total)
+	for _, s := range v {
+		buffer = append(buffer, s...)
+		buffer = append(buffer, sep...)
+	}
+	return buffer
 }
 
 // InStrArr inArray str interface
@@ -679,7 +677,7 @@ func GetLocalUdp4IP() (net.IP, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	la, ok := c.LocalAddr().(*net.UDPAddr)
 	if !ok || la == nil || la.IP == nil {
 		return nil, fmt.Errorf("get local udp4 ip failed")
@@ -693,7 +691,7 @@ func GetLocalUdp6IP() (net.IP, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	la, ok := c.LocalAddr().(*net.UDPAddr)
 	if !ok || la == nil || la.IP == nil {
 		return nil, fmt.Errorf("get local udp6 ip failed")
@@ -869,10 +867,7 @@ func IsSameIPType(addr1, addr2 string) bool {
 	ip1 := strings.Contains(addr1, "[")
 	ip2 := strings.Contains(addr2, "[")
 
-	if ip1 == ip2 {
-		return true
-	}
-	return false
+	return ip1 == ip2
 }
 
 func GetMatchingLocalAddr(remoteAddr, localAddr string) (string, error) {
@@ -888,14 +883,14 @@ func GetMatchingLocalAddr(remoteAddr, localAddr string) (string, error) {
 			return localAddr, fmt.Errorf("get local ipv6 addr: %w", err)
 		}
 		ip6 := tmpConn.LocalAddr().(*net.UDPAddr).IP.String()
-		return fmt.Sprintf("[%s]:%s", ip6, port), nil
+		return "[" + ip6 + "]:" + port, nil
 	} else {
 		tmpConn, err := GetLocalUdp4Addr()
 		if err != nil {
 			return localAddr, fmt.Errorf("get local ipv4 addr: %w", err)
 		}
 		ip4 := tmpConn.LocalAddr().(*net.UDPAddr).IP.String()
-		return fmt.Sprintf("%s:%s", ip4, port), nil
+		return ip4 + ":" + port, nil
 	}
 }
 
@@ -952,7 +947,7 @@ func PickEgressIPFor(dstIP net.IP) net.IP {
 	if err != nil {
 		return nil
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if la, ok := conn.LocalAddr().(*net.UDPAddr); ok && la != nil && !IsZeroIP(la.IP) {
 		return la.IP
 	}
@@ -980,8 +975,7 @@ func GetOutboundIP() net.IP {
 	if err != nil {
 		return net.ParseIP("127.0.0.1")
 	}
-	defer conn.Close()
-
+	defer func() { _ = conn.Close() }()
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
 	return localAddr.IP
 }
@@ -1135,7 +1129,7 @@ func CalibrateTimeOffset(server string) (time.Duration, error) {
 	if err != nil {
 		return 0, err
 	}
-	return ntpTime.Sub(time.Now()), nil
+	return time.Until(ntpTime), nil
 }
 
 func TimeOffset() time.Duration {

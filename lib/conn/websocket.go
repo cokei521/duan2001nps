@@ -14,36 +14,45 @@ import (
 
 type WsConn struct {
 	*websocket.Conn
-	RealIP  string
-	readBuf []byte
+	RealIP    string
+	readFrame io.Reader
 }
 
 func NewWsConn(ws *websocket.Conn) *WsConn {
-	return &WsConn{Conn: ws, readBuf: make([]byte, 0)}
+	return &WsConn{Conn: ws}
 }
 
 func (c *WsConn) Read(p []byte) (int, error) {
-	if len(c.readBuf) > 0 {
-		n := copy(p, c.readBuf)
-		c.readBuf = c.readBuf[n:]
-		return n, nil
+	if len(p) == 0 {
+		return 0, nil
 	}
-	mt, r, err := c.NextReader()
-	if err != nil {
-		return 0, err
+
+	for {
+		if c.readFrame == nil {
+			mt, r, err := c.NextReader()
+			if err != nil {
+				return 0, err
+			}
+			if mt == websocket.CloseMessage {
+				return 0, io.EOF
+			}
+			c.readFrame = r
+		}
+
+		n, err := c.readFrame.Read(p)
+		switch {
+		case n > 0 && err == io.EOF:
+			c.readFrame = nil
+			return n, nil
+		case n > 0:
+			return n, err
+		case err == io.EOF:
+			c.readFrame = nil
+			continue
+		default:
+			return 0, err
+		}
 	}
-	if mt == websocket.CloseMessage {
-		return 0, io.EOF
-	}
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return 0, err
-	}
-	n := copy(p, data)
-	if n < len(data) {
-		c.readBuf = append(c.readBuf, data[n:]...)
-	}
-	return n, nil
 }
 
 func (c *WsConn) Write(p []byte) (int, error) {
@@ -110,7 +119,7 @@ func NewWSListener(base net.Listener, path, trustedIps, realIpHeader string) net
 		ch <- c
 	})
 	srv := &http.Server{Handler: mux}
-	go srv.Serve(base)
+	go func() { _ = srv.Serve(base) }()
 	go func() {
 		<-hl.closeCh
 		_ = srv.Close()
@@ -145,7 +154,7 @@ func NewWSSListener(base net.Listener, path string, cert tls.Certificate, truste
 	})
 	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
 	srv := &http.Server{Handler: mux, TLSConfig: tlsConfig}
-	go srv.Serve(tls.NewListener(base, tlsConfig))
+	go func() { _ = srv.Serve(tls.NewListener(base, tlsConfig)) }()
 	go func() {
 		<-hl.closeCh
 		_ = srv.Close()
