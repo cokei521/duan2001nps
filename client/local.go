@@ -19,7 +19,6 @@ import (
 	"github.com/djylb/nps/lib/mux"
 	"github.com/djylb/nps/server/proxy"
 	"github.com/quic-go/quic-go"
-	"github.com/xtaci/kcp-go/v5"
 )
 
 // ------------------------------
@@ -259,7 +258,7 @@ func (b *P2pBridge) IsServer() bool {
 }
 
 func (b *P2pBridge) CliProcess(*conn.Conn, string) {
-	return
+	// no-op
 }
 
 func (mgr *P2PManager) StartLocalServer(l *config.LocalServer) error {
@@ -620,8 +619,6 @@ func (mgr *P2PManager) newUdpConn(localAddr string, cfg *config.CommonConfig, l 
 		mgr.mu.Lock()
 		if mgr.uuid == "" {
 			mgr.uuid = uuid
-		} else {
-			uuid = mgr.uuid
 		}
 		mgr.mu.Unlock()
 	}
@@ -685,17 +682,20 @@ func (mgr *P2PManager) newUdpConn(localAddr string, cfg *config.CommonConfig, l 
 	if mode == "" || mode != P2PMode {
 		mode = common.CONN_KCP
 	}
+	logs.Debug("handleP2PUdp result local=%s remote=%s role=%s mode=%s data=%s", localAddr, remoteAddr, role, mode, data)
 	//logs.Debug("handleP2PUdp ok")
 
 	var udpTunnel net.Conn
 	var sess *quic.Conn
+
+	rUDPAddr, err := net.ResolveUDPAddr("udp", remoteAddr)
+	if err != nil {
+		logs.Error("Failed to resolve remote UDP addr: %v", err)
+		_ = localConn.Close()
+		return
+	}
+
 	if mode == common.CONN_QUIC {
-		rUDPAddr, err := net.ResolveUDPAddr("udp", remoteAddr)
-		if err != nil {
-			logs.Error("Failed to resolve remote UDP addr: %v", err)
-			_ = localConn.Close()
-			return
-		}
 		sess, err = quic.Dial(mgr.ctx, localConn, rUDPAddr, TlsCfg, QuicConfig)
 		if err != nil {
 			logs.Error("QUIC dial error: %v", err)
@@ -715,13 +715,12 @@ func (mgr *P2PManager) newUdpConn(localAddr string, cfg *config.CommonConfig, l 
 			return
 		}
 	} else {
-		kcpTunnel, err := kcp.NewConn(remoteAddr, nil, 150, 3, localConn)
-		if err != nil || kcpTunnel == nil {
-			logs.Warn("KCP NewConn failed: %v", err)
+		kcpTunnel, err := conn.NewKCPSessionWithConn(rUDPAddr, localConn)
+		if err != nil {
+			logs.Warn("KCP create failed: %v", err)
 			_ = localConn.Close()
 			return
 		}
-		conn.SetUdpSession(kcpTunnel)
 		udpTunnel = kcpTunnel
 	}
 

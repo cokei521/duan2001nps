@@ -28,8 +28,8 @@ type Conn struct {
 
 func NewConn(connId int32, mux *Mux) *Conn {
 	c := &Conn{
-		connStatusOkCh:   make(chan struct{}),
-		connStatusFailCh: make(chan struct{}),
+		connStatusOkCh:   make(chan struct{}, 1),
+		connStatusFailCh: make(chan struct{}, 1),
 		connId:           connId,
 		priority:         false,
 		receiveWindow:    new(receiveWindow),
@@ -82,21 +82,29 @@ func (s *Conn) SetClosingFlag() {
 }
 
 func (s *Conn) Close() (err error) {
-	s.once.Do(s.closeProcess)
+	s.once.Do(func() {
+		s.closeProcess(true)
+	})
 	return
 }
 
-func (s *Conn) closeProcess() {
+func (s *Conn) closeLocal() {
+	s.once.Do(func() {
+		s.closeProcess(false)
+	})
+}
+
+func (s *Conn) closeProcess(notifyRemote bool) {
 	atomic.StoreUint32(&s.isClose, 1)
 	s.receiveWindow.mux.connMap.Delete(s.connId)
-	if !s.receiveWindow.mux.IsClosed() {
+	if notifyRemote && !s.receiveWindow.mux.IsClosed() {
 		// if server or user close the conn while reading, will Get an io.EOF
 		// and this Close method will be invoked, send this signal to close other side
 		s.receiveWindow.mux.sendInfo(muxConnClose, s.connId, s.priority, nil)
 	}
 	s.sendWindow.CloseWindow()
 	s.receiveWindow.CloseWindow()
-	return
+	//return
 }
 
 func (s *Conn) LocalAddr() net.Addr {
@@ -276,7 +284,7 @@ func (Self *receiveWindow) calcSize() {
 		Self.count = -10
 	}
 	Self.count += 1
-	return
+	//return
 }
 
 func (Self *receiveWindow) Write(buf []byte, l uint16, part bool, id int32) (err error) {
@@ -354,7 +362,7 @@ copyData:
 	pOff += l
 	Self.off += uint32(l)
 	n += l
-	l = 0
+	//l = 0
 	if Self.off == uint32(Self.element.L) {
 		windowBuff.Put(Self.element.Buf)
 		Self.sendStatus(id, Self.element.L)
@@ -403,7 +411,7 @@ func (Self *receiveWindow) sendStatus(id int32, l uint16) {
 		runtime.Gosched()
 		// another goroutine change remaining or wait status, make sure
 	}
-	return
+	//return
 }
 
 func (Self *receiveWindow) SetTimeOut(t time.Time) {
@@ -654,7 +662,7 @@ func (Self *sendWindow) WriteFull(buf []byte, id int32) (n int, err error) {
 			break
 		}
 		n += int(l)
-		l = 0
+		//l = 0
 		if part {
 			Self.mux.sendInfo(muxNewMsgPart, id, Self.priority, bufSeg)
 		} else {

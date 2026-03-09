@@ -25,18 +25,22 @@ func NewTcpListenerAndProcess(addr string, f func(c net.Conn), listener *net.Lis
 }
 
 func NewKcpListenerAndProcess(addr string, f func(c net.Conn)) error {
-	kcpListener, err := kcp.ListenWithOptions(addr, nil, 150, 3)
+	kcpListener, err := kcp.ListenWithOptions(addr, nil, 10, 3)
 	if err != nil {
 		logs.Error("KCP listen error: %v", err)
 		return err
 	}
 	for {
 		c, err := kcpListener.AcceptKCP()
-		SetUdpSession(c)
 		if err != nil {
+			//if errors.Is(err, net.ErrClosed) {
+			//	logs.Info("KCP listener closed intentionally.")
+			//	break
+			//}
 			logs.Trace("KCP accept session error: %v", err)
 			continue
 		}
+		SetUdpSession(c)
 		go f(c)
 	}
 	//return nil

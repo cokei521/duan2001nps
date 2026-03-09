@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -53,7 +52,7 @@ var QuicConfig = &quic.Config{
 }
 
 func init() {
-	rand.Seed(time.Now().UnixNano())
+	//rand.Seed(time.Now().UnixNano())
 	crypt.InitTls(tls.Certificate{})
 }
 
@@ -414,9 +413,8 @@ func NewConn(tp string, vkey string, server string, proxyUrl string, localIP str
 		}
 		connection = conn.NewQuicAutoCloseConn(stream, sess)
 	default:
-		sess, err = dialKCPWithLocalIP(server, localIP)
+		sess, err = conn.DialKCPWithLocalIP(server, localIP)
 		if err == nil {
-			conn.SetUdpSession(sess)
 			connection = sess
 		}
 	}
@@ -432,7 +430,7 @@ func NewConn(tp string, vkey string, server string, proxyUrl string, localIP str
 
 	//logs.Debug("SetDeadline")
 	_ = connection.SetDeadline(time.Now().Add(timeout))
-	defer connection.SetDeadline(time.Time{})
+	defer func() { _ = connection.SetDeadline(time.Time{}) }()
 
 	c := conn.NewConn(connection)
 	if c == nil {
@@ -713,25 +711,8 @@ func dialQuicWithLocalIP(ctx context.Context, server string, tlsCfg *tls.Config,
 	return sess, nil
 }
 
-func dialKCPWithLocalIP(server, localIP string) (*kcp.UDPSession, error) {
-	bindAddr := common.BuildUDPBindAddr(localIP)
-	if bindAddr == nil {
-		return kcp.DialWithOptions(server, nil, 10, 3)
-	}
-	packetConn, err := net.ListenUDP("udp", bindAddr)
-	if err != nil {
-		return nil, err
-	}
-	sess, err := kcp.NewConn(server, nil, 10, 3, packetConn)
-	if err != nil {
-		_ = packetConn.Close()
-		return nil, err
-	}
-	return sess, nil
-}
-
 // get a basic auth string
-func getBasicAuth(username, password string) string {
-	auth := username + ":" + password
-	return base64.StdEncoding.EncodeToString([]byte(auth))
-}
+//func getBasicAuth(username, password string) string {
+//	auth := username + ":" + password
+//	return base64.StdEncoding.EncodeToString([]byte(auth))
+//}

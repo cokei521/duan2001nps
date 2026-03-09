@@ -20,7 +20,6 @@ import (
 	"github.com/djylb/nps/lib/goroutine"
 	"github.com/djylb/nps/lib/logs"
 	"github.com/djylb/nps/lib/rate"
-	"github.com/xtaci/kcp-go/v5"
 )
 
 // GetConn get crypt or snappy conn
@@ -65,13 +64,13 @@ func GetLenBytes(buf []byte) (b []byte, err error) {
 	return
 }
 
-func IsTempOrTimeout(err error) bool {
+func IsTimeout(err error) bool {
 	if err == nil {
 		return false
 	}
 	var ne net.Error
 	if errors.As(err, &ne) {
-		return ne.Temporary() || ne.Timeout()
+		return ne.Timeout()
 	} else {
 		s := strings.ToLower(strings.ReplaceAll(err.Error(), " ", ""))
 		return strings.Contains(s, "timeout")
@@ -99,7 +98,7 @@ func HandleUdp5(ctx context.Context, serverConn net.Conn, timeout time.Duration,
 	// Internet -> tunnel: read UDP responses, encode to SOCKS5-UDP, send through tunnel.
 	go func() {
 		defer cancel()
-		buf := common.BufPoolUdp.Get().([]byte)
+		buf := common.BufPoolUdp.Get()
 		defer common.BufPoolUdp.Put(buf)
 
 		for {
@@ -115,7 +114,7 @@ func HandleUdp5(ctx context.Context, serverConn net.Conn, timeout time.Duration,
 					logs.Debug("local UDP closed, exiting goroutine")
 					return
 				}
-				if IsTempOrTimeout(err) {
+				if IsTimeout(err) {
 					logs.Debug("temporary UDP read error, retrying: %v", err)
 					continue
 				}
@@ -134,8 +133,8 @@ func HandleUdp5(ctx context.Context, serverConn net.Conn, timeout time.Duration,
 	}()
 
 	// Tunnel -> internet: read framed bytes, parse as SOCKS5-UDP, send via local UDP socket.
-	frameBuf := common.BufPoolMax.Get().([]byte)
-	defer common.PutBufPoolMax(frameBuf)
+	frameBuf := common.BufPool.Get()
+	defer common.BufPool.Put(frameBuf)
 
 	for {
 		select {
@@ -170,7 +169,7 @@ func HandleUdp5(ctx context.Context, serverConn net.Conn, timeout time.Duration,
 			continue
 		}
 		if _, err := local.WriteTo(dgram.Data, rAddr); err != nil {
-			if IsTempOrTimeout(err) {
+			if IsTimeout(err) {
 				logs.Debug("temporary UDP write error to %v, retrying: %v", rAddr, err)
 				continue
 			}
@@ -178,18 +177,6 @@ func HandleUdp5(ctx context.Context, serverConn net.Conn, timeout time.Duration,
 			return
 		}
 	}
-}
-
-// SetUdpSession udp connection setting
-func SetUdpSession(sess *kcp.UDPSession) {
-	//sess.SetStreamMode(true)
-	sess.SetWindowSize(1024, 1024)
-	_ = sess.SetReadBuffer(64 * 1024)
-	_ = sess.SetWriteBuffer(64 * 1024)
-	sess.SetNoDelay(1, 10, 2, 1)
-	sess.SetMtu(1600)
-	sess.SetACKNoDelay(true)
-	sess.SetWriteDelay(false)
 }
 
 func WriteACK(c net.Conn, timeout time.Duration) error {
@@ -250,7 +237,7 @@ func CopyWaitGroup(conn1, conn2 net.Conn, crypt bool, snappy bool, rate *rate.Ra
 	wg.Wait()
 	_ = conn1.Close()
 	_ = conn2.Close()
-	return
+	//return
 }
 
 func ParseAddr(addr string) net.Addr {

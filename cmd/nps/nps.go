@@ -106,7 +106,7 @@ func main() {
 			logPath = filepath.Join(common.GetRunPath(), logPath)
 		}
 		if common.IsWindows() {
-			logPath = strings.Replace(logPath, "\\", "\\\\", -1)
+			logPath = strings.ReplaceAll(logPath, "\\", "\\\\")
 		}
 	}
 	logMaxFiles := beego.AppConfig.DefaultInt("log_max_files", 30)
@@ -258,7 +258,7 @@ type nps struct {
 
 func (p *nps) Start(s service.Service) error {
 	_, _ = s.Status()
-	go p.run()
+	go func() { _ = p.run() }()
 	return nil
 }
 func (p *nps) Stop(s service.Service) error {
@@ -280,10 +280,8 @@ func (p *nps) run() error {
 		}
 	}()
 	run()
-	select {
-	case <-p.exit:
-		logs.Warn("stop...")
-	}
+	<-p.exit
+	logs.Warn("stop...")
 	return nil
 }
 
@@ -312,8 +310,7 @@ func run() {
 	crypt.InitTls(cert)
 	tool.InitAllowPort()
 	tool.StartSystemInfo()
-	timeout := beego.AppConfig.DefaultInt("disconnect_timeout", 60)
-	bridgePort := connection.BridgePort
+	timeout := beego.AppConfig.DefaultInt("disconnect_timeout", 30)
 	bridgeType := beego.AppConfig.DefaultString("bridge_type", "both")
 	bridge.ServerKcpEnable = beego.AppConfig.DefaultBool("kcp_enable", true) && connection.BridgeKcpPort != 0 && (bridgeType == "kcp" || bridgeType == "udp" || bridgeType == "both")
 	bridge.ServerQuicEnable = beego.AppConfig.DefaultBool("quic_enable", true) && connection.BridgeQuicPort != 0 && (bridgeType == "quic" || bridgeType == "udp" || bridgeType == "both")
@@ -324,5 +321,5 @@ func run() {
 	bridge.ServerTlsEnable = beego.AppConfig.DefaultBool("tls_enable", true) && connection.BridgeTlsPort != 0 && bridgeType == "tcp"
 	bridge.ServerWsEnable = beego.AppConfig.DefaultBool("ws_enable", true) && connection.BridgeWsPort != 0 && connection.BridgePath != "" && bridgeType == "tcp"
 	bridge.ServerWssEnable = beego.AppConfig.DefaultBool("wss_enable", true) && connection.BridgeWssPort != 0 && connection.BridgePath != "" && bridgeType == "tcp"
-	go server.StartNewServer(bridgePort, task, bridgeType, timeout)
+	go server.StartNewServer(task, timeout)
 }
