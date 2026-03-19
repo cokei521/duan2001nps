@@ -3,13 +3,9 @@ package server
 import (
 	"errors"
 	"fmt"
-	"math"
 	"os"
-	"sort"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/beego/beego"
@@ -25,10 +21,6 @@ import (
 	"github.com/djylb/nps/server/proxy"
 	"github.com/djylb/nps/server/proxy/httpproxy"
 	"github.com/djylb/nps/server/tool"
-	"github.com/shirou/gopsutil/v4/cpu"
-	"github.com/shirou/gopsutil/v4/load"
-	"github.com/shirou/gopsutil/v4/mem"
-	"github.com/shirou/gopsutil/v4/net"
 )
 
 var (
@@ -37,6 +29,8 @@ var (
 	once           sync.Once
 	HttpProxyCache = index.NewAnyIntIndex()
 )
+
+const pingTimeout = 15 * time.Second
 
 func init() {
 	RunList = sync.Map{}
@@ -150,18 +144,28 @@ func StartNewServer(cnf *file.Tunnel, bridgeDisconnect int) {
 	go func() {
 		if err := Bridge.StartTunnel(); err != nil {
 			logs.Error("start server bridge error %v", err)
-			os.Exit(0)
+			os.Exit(1)
 		}
 	}()
 	if p, err := beego.AppConfig.Int("p2p_port"); err == nil {
+		extraReply := beego.AppConfig.DefaultBool("p2p_probe_extra_reply", true)
+		ok := true
 		for i := 0; i < 3; i++ {
 			port := p + i
 			if common.TestUdpPort(port) {
-				go func(pp int) { _ = proxy.NewP2PServer(pp).Start() }(port)
-				logs.Info("Started P2P Server on port %d", port)
+				logs.Info("P2P probe port %d available", port)
 			} else {
 				logs.Error("Port %d is unavailable.", port)
+				ok = false
 			}
+		}
+		if ok {
+			go func(basePort int, enableExtraReply bool) {
+				if err := proxy.NewP2PServer(basePort, enableExtraReply).Start(); err != nil {
+					logs.Error("p2p probe server stopped unexpectedly: %v", err)
+				}
+			}(p, extraReply)
+			logs.Info("Started P2P probe server on ports %d-%d", p, p+2)
 		}
 	}
 	go DealBridgeTask()
@@ -185,8 +189,6 @@ func dealClientFlow() {
 		dealClientData()
 	}
 }
-
-const pingTimeout = 15 * time.Second
 
 func PingClient(id int, addr string) int {
 	if id <= 0 {
@@ -331,590 +333,42 @@ func DelTask(id int) error {
 	return file.GetDb().DelTask(id)
 }
 
-// GetTunnel get task list by page num
-func GetTunnel(start, length int, typeVal string, clientId int, search string, sortField string, order string) ([]*file.Tunnel, int) {
-	allList := make([]*file.Tunnel, 0) //store all Tunnel
-	list := make([]*file.Tunnel, 0)
-	originLength := length
-	var cnt int
-
-	keys := file.GetMapKeys(&file.GetDb().JsonDb.Tasks, false, "", "")
-
-	// get all Tunnel and filter
-	for _, key := range keys {
-		if value, ok := file.GetDb().JsonDb.Tasks.Load(key); ok {
-			v := value.(*file.Tunnel)
-			if (typeVal != "" && v.Mode != typeVal || (clientId != 0 && v.Client.Id != clientId)) || (typeVal == "" && clientId != v.Client.Id) {
-				continue
-			}
-			allList = append(allList, v)
+// DelTunnelAndHostByClientId delete all host and tasks by client id
+func DelTunnelAndHostByClientId(clientId int, justDelNoStore bool) {
+	var ids []int
+	file.GetDb().JsonDb.Tasks.Range(func(key, value interface{}) bool {
+		v := value.(*file.Tunnel)
+		if justDelNoStore && !v.NoStore {
+			return true
 		}
+		if v.Client.Id == clientId {
+			ids = append(ids, v.Id)
+		}
+		return true
+	})
+	for _, id := range ids {
+		_ = DelTask(id)
 	}
-
-	// sort by field, asc or desc
-	switch sortField {
-	case "Id":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Id < allList[j].Id })
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Id > allList[j].Id })
+	ids = ids[:0]
+	file.GetDb().JsonDb.Hosts.Range(func(key, value interface{}) bool {
+		v := value.(*file.Host)
+		if justDelNoStore && !v.NoStore {
+			return true
 		}
-
-	case "Client.Id":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Client.Id < allList[j].Client.Id })
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Client.Id > allList[j].Client.Id })
+		if v.Client.Id == clientId {
+			ids = append(ids, v.Id)
 		}
-
-	case "Remark":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Remark < allList[j].Remark })
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Remark > allList[j].Remark })
-		}
-
-	case "Client.VerifyKey":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Client.VerifyKey < allList[j].Client.VerifyKey })
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Client.VerifyKey > allList[j].Client.VerifyKey })
-		}
-
-	case "Target.TargetStr":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Target.TargetStr < allList[j].Target.TargetStr })
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Target.TargetStr > allList[j].Target.TargetStr })
-		}
-
-	case "Port":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Port < allList[j].Port })
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Port > allList[j].Port })
-		}
-
-	case "Mode":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Mode < allList[j].Mode })
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Mode > allList[j].Mode })
-		}
-
-	case "TargetType":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].TargetType < allList[j].TargetType })
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].TargetType > allList[j].TargetType })
-		}
-
-	case "Password":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Password < allList[j].Password })
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Password > allList[j].Password })
-		}
-
-	case "HttpProxy":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].HttpProxy && !allList[j].HttpProxy })
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return !allList[i].HttpProxy && allList[j].HttpProxy })
-		}
-
-	case "Socks5Proxy":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Socks5Proxy && !allList[j].Socks5Proxy })
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return !allList[i].Socks5Proxy && allList[j].Socks5Proxy })
-		}
-
-	case "NowConn":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].NowConn < allList[j].NowConn })
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].NowConn > allList[j].NowConn })
-		}
-
-	case "InletFlow":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Flow.InletFlow < allList[j].Flow.InletFlow })
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Flow.InletFlow > allList[j].Flow.InletFlow })
-		}
-
-	case "ExportFlow":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Flow.ExportFlow < allList[j].Flow.ExportFlow })
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Flow.ExportFlow > allList[j].Flow.ExportFlow })
-		}
-
-	case "TotalFlow":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool {
-				return allList[i].Flow.InletFlow+allList[i].Flow.ExportFlow < allList[j].Flow.InletFlow+allList[j].Flow.ExportFlow
-			})
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool {
-				return allList[i].Flow.InletFlow+allList[i].Flow.ExportFlow > allList[j].Flow.InletFlow+allList[j].Flow.ExportFlow
-			})
-		}
-
-	case "FlowRemain":
-		asc := order == "asc"
-		const mb = int64(1024 * 1024)
-		rem := func(f *file.Flow) int64 {
-			if f.FlowLimit == 0 {
-				if asc {
-					return math.MaxInt64
-				}
-				return math.MinInt64
-			}
-			return f.FlowLimit*mb - (f.InletFlow + f.ExportFlow)
-		}
-		sort.SliceStable(allList, func(i, j int) bool {
-			ri, rj := rem(allList[i].Flow), rem(allList[j].Flow)
-			if asc {
-				return ri < rj
-			}
-			return ri > rj
-		})
-
-	case "Flow.FlowLimit":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool {
-				vi, vj := allList[i].Flow.FlowLimit, allList[j].Flow.FlowLimit
-				return (vi != 0 && vj == 0) || (vi != 0 && vj != 0 && vi < vj)
-			})
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Flow.FlowLimit > allList[j].Flow.FlowLimit })
-		}
-
-	case "Flow.TimeLimit", "TimeRemain":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool {
-				ti, tj := allList[i].Flow.TimeLimit, allList[j].Flow.TimeLimit
-				return (!ti.IsZero() && tj.IsZero()) || (!ti.IsZero() && !tj.IsZero() && ti.Before(tj))
-			})
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Flow.TimeLimit.After(allList[j].Flow.TimeLimit) })
-		}
-
-	case "Status":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Status && !allList[j].Status })
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return !allList[i].Status && allList[j].Status })
-		}
-
-	case "RunStatus":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].RunStatus && !allList[j].RunStatus })
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return !allList[i].RunStatus && allList[j].RunStatus })
-		}
-
-	case "Client.IsConnect":
-		if order == "asc" {
-			sort.SliceStable(allList, func(i, j int) bool { return allList[i].Client.IsConnect && !allList[j].Client.IsConnect })
-		} else {
-			sort.SliceStable(allList, func(i, j int) bool { return !allList[i].Client.IsConnect && allList[j].Client.IsConnect })
-		}
+		return true
+	})
+	for _, id := range ids {
+		HttpProxyCache.Remove(id)
+		_ = file.GetDb().DelHost(id)
 	}
-
-	searchInt := common.GetIntNoErrByStr(search)
-
-	// search + paging
-	for _, v := range allList {
-		if search != "" &&
-			v.Id != searchInt &&
-			v.Port != searchInt &&
-			!common.ContainsFold(v.Password, search) &&
-			!common.ContainsFold(v.Remark, search) &&
-			!common.ContainsFold(v.Target.TargetStr, search) {
-			continue
-		}
-
-		cnt++
-
-		if _, ok := Bridge.Client.Load(v.Client.Id); ok {
-			v.Client.IsConnect = true
-		} else {
-			v.Client.IsConnect = false
-		}
-
-		if _, ok := RunList.Load(v.Id); ok {
-			v.RunStatus = true
-		} else {
-			v.RunStatus = false
-		}
-
-		if start--; start < 0 {
-			if originLength == 0 {
-				list = append(list, v)
-			} else if length--; length >= 0 {
-				list = append(list, v)
-			}
-		}
-	}
-
-	return list, cnt
 }
 
-// GetHostList get client list
-func GetHostList(start, length, clientId int, search, sortField, order string) (list []*file.Host, cnt int) {
-	list, cnt = file.GetDb().GetHost(start, length, clientId, search)
-
-	// sort by field, asc or desc
-	switch sortField {
-	case "Id":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Id < list[j].Id })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Id > list[j].Id })
-		}
-
-	case "Client.Id":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Client.Id < list[j].Client.Id })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Client.Id > list[j].Client.Id })
-		}
-
-	case "Remark":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Remark < list[j].Remark })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Remark > list[j].Remark })
-		}
-
-	case "Client.VerifyKey":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Client.VerifyKey < list[j].Client.VerifyKey })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Client.VerifyKey > list[j].Client.VerifyKey })
-		}
-
-	case "Host":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Host < list[j].Host })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Host > list[j].Host })
-		}
-
-	case "Scheme":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Scheme < list[j].Scheme })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Scheme > list[j].Scheme })
-		}
-
-	case "TargetIsHttps":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].TargetIsHttps && !list[j].TargetIsHttps })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return !list[i].TargetIsHttps && list[j].TargetIsHttps })
-		}
-
-	case "Target.TargetStr":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Target.TargetStr < list[j].Target.TargetStr })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Target.TargetStr > list[j].Target.TargetStr })
-		}
-
-	case "Location":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Location < list[j].Location })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Location > list[j].Location })
-		}
-
-	case "PathRewrite":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].PathRewrite < list[j].PathRewrite })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].PathRewrite > list[j].PathRewrite })
-		}
-
-	case "CertType":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].CertType < list[j].CertType })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].CertType > list[j].CertType })
-		}
-
-	case "AutoSSL":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].AutoSSL && !list[j].AutoSSL })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return !list[i].AutoSSL && list[j].AutoSSL })
-		}
-
-	case "AutoHttps":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].AutoHttps && !list[j].AutoHttps })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return !list[i].AutoHttps && list[j].AutoHttps })
-		}
-
-	case "AutoCORS":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].AutoCORS && !list[j].AutoCORS })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return !list[i].AutoCORS && list[j].AutoCORS })
-		}
-
-	case "CompatMode":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].CompatMode && !list[j].CompatMode })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return !list[i].CompatMode && list[j].CompatMode })
-		}
-
-	case "HttpsJustProxy":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].HttpsJustProxy && !list[j].HttpsJustProxy })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return !list[i].HttpsJustProxy && list[j].HttpsJustProxy })
-		}
-
-	case "TlsOffload":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].TlsOffload && !list[j].TlsOffload })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return !list[i].TlsOffload && list[j].TlsOffload })
-		}
-
-	case "NowConn":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].NowConn < list[j].NowConn })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].NowConn > list[j].NowConn })
-		}
-
-	case "InletFlow":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Flow.InletFlow < list[j].Flow.InletFlow })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Flow.InletFlow > list[j].Flow.InletFlow })
-		}
-
-	case "ExportFlow":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Flow.ExportFlow < list[j].Flow.ExportFlow })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Flow.ExportFlow > list[j].Flow.ExportFlow })
-		}
-
-	case "TotalFlow":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool {
-				return list[i].Flow.InletFlow+list[i].Flow.ExportFlow < list[j].Flow.InletFlow+list[j].Flow.ExportFlow
-			})
-		} else {
-			sort.SliceStable(list, func(i, j int) bool {
-				return list[i].Flow.InletFlow+list[i].Flow.ExportFlow > list[j].Flow.InletFlow+list[j].Flow.ExportFlow
-			})
-		}
-
-	case "FlowRemain":
-		asc := order == "asc"
-		const mb = int64(1024 * 1024)
-		rem := func(f *file.Flow) int64 {
-			if f.FlowLimit == 0 {
-				if asc {
-					return math.MaxInt64
-				}
-				return math.MinInt64
-			}
-			return f.FlowLimit*mb - (f.InletFlow + f.ExportFlow)
-		}
-		sort.SliceStable(list, func(i, j int) bool {
-			ri, rj := rem(list[i].Flow), rem(list[j].Flow)
-			if asc {
-				return ri < rj
-			}
-			return ri > rj
-		})
-
-	case "Flow.FlowLimit":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool {
-				vi, vj := list[i].Flow.FlowLimit, list[j].Flow.FlowLimit
-				return (vi != 0 && vj == 0) || (vi != 0 && vj != 0 && vi < vj)
-			})
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Flow.FlowLimit > list[j].Flow.FlowLimit })
-		}
-
-	case "Flow.TimeLimit", "TimeRemain":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool {
-				ti, tj := list[i].Flow.TimeLimit, list[j].Flow.TimeLimit
-				return (!ti.IsZero() && tj.IsZero()) || (!ti.IsZero() && !tj.IsZero() && ti.Before(tj))
-			})
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Flow.TimeLimit.After(list[j].Flow.TimeLimit) })
-		}
-
-	case "IsClose":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].IsClose && !list[j].IsClose })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return !list[i].IsClose && list[j].IsClose })
-		}
-
-	case "Client.IsConnect":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Client.IsConnect && !list[j].Client.IsConnect })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return !list[i].Client.IsConnect && list[j].Client.IsConnect })
-		}
-	}
-
-	return
-}
-
-// GetClientList get client list
-func GetClientList(start, length int, search, sortField, order string, clientId int) (list []*file.Client, cnt int) {
-	list, cnt = file.GetDb().GetClientList(start, length, search, sortField, order, clientId)
-
-	// sort by Id, Remark, Port..., asc or desc
-	switch sortField {
-	case "Id":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Id < list[j].Id })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Id > list[j].Id })
-		}
-
-	case "Addr":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Addr < list[j].Addr })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Addr > list[j].Addr })
-		}
-
-	case "LocalAddr":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].LocalAddr < list[j].LocalAddr })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].LocalAddr > list[j].LocalAddr })
-		}
-
-	case "Remark":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Remark < list[j].Remark })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Remark > list[j].Remark })
-		}
-
-	case "VerifyKey":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].VerifyKey < list[j].VerifyKey })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].VerifyKey > list[j].VerifyKey })
-		}
-
-	case "TotalFlow":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool {
-				return list[i].Flow.InletFlow+list[i].Flow.ExportFlow < list[j].Flow.InletFlow+list[j].Flow.ExportFlow
-			})
-		} else {
-			sort.SliceStable(list, func(i, j int) bool {
-				return list[i].Flow.InletFlow+list[i].Flow.ExportFlow > list[j].Flow.InletFlow+list[j].Flow.ExportFlow
-			})
-		}
-
-	case "FlowRemain":
-		asc := order == "asc"
-		const mb = int64(1024 * 1024)
-		rem := func(f *file.Flow) int64 {
-			if f.FlowLimit == 0 {
-				if asc {
-					return math.MaxInt64
-				}
-				return math.MinInt64
-			}
-			return f.FlowLimit*mb - (f.InletFlow + f.ExportFlow)
-		}
-		sort.SliceStable(list, func(i, j int) bool {
-			ri, rj := rem(list[i].Flow), rem(list[j].Flow)
-			if asc {
-				return ri < rj
-			}
-			return ri > rj
-		})
-
-	case "NowConn":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].NowConn < list[j].NowConn })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].NowConn > list[j].NowConn })
-		}
-
-	case "Version":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Version < list[j].Version })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Version > list[j].Version })
-		}
-
-	case "Mode":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Mode < list[j].Mode })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Mode > list[j].Mode })
-		}
-
-	case "Rate.NowRate":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Rate.Now() < list[j].Rate.Now() })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Rate.Now() > list[j].Rate.Now() })
-		}
-
-	case "Flow.FlowLimit":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool {
-				vi, vj := list[i].Flow.FlowLimit, list[j].Flow.FlowLimit
-				return (vi != 0 && vj == 0) || (vi != 0 && vj != 0 && vi < vj)
-			})
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Flow.FlowLimit > list[j].Flow.FlowLimit })
-		}
-
-	case "Flow.TimeLimit", "TimeRemain":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool {
-				ti, tj := list[i].Flow.TimeLimit, list[j].Flow.TimeLimit
-				return (!ti.IsZero() && tj.IsZero()) || (!ti.IsZero() && !tj.IsZero() && ti.Before(tj))
-			})
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Flow.TimeLimit.After(list[j].Flow.TimeLimit) })
-		}
-
-	case "Status":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].Status && !list[j].Status })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return !list[i].Status && list[j].Status })
-		}
-
-	case "IsConnect":
-		if order == "asc" {
-			sort.SliceStable(list, func(i, j int) bool { return list[i].IsConnect && !list[j].IsConnect })
-		} else {
-			sort.SliceStable(list, func(i, j int) bool { return !list[i].IsConnect && list[j].IsConnect })
-		}
-	}
-
-	dealClientData()
-	return
+// DelClientConnect close the client
+func DelClientConnect(clientId int) {
+	Bridge.DelClient(clientId)
 }
 
 func dealClientData() {
@@ -977,373 +431,6 @@ func dealClientData() {
 		return true
 	})
 	//return
-}
-
-// DelTunnelAndHostByClientId delete all host and tasks by client id
-func DelTunnelAndHostByClientId(clientId int, justDelNoStore bool) {
-	var ids []int
-	file.GetDb().JsonDb.Tasks.Range(func(key, value interface{}) bool {
-		v := value.(*file.Tunnel)
-		if justDelNoStore && !v.NoStore {
-			return true
-		}
-		if v.Client.Id == clientId {
-			ids = append(ids, v.Id)
-		}
-		return true
-	})
-	for _, id := range ids {
-		_ = DelTask(id)
-	}
-	ids = ids[:0]
-	file.GetDb().JsonDb.Hosts.Range(func(key, value interface{}) bool {
-		v := value.(*file.Host)
-		if justDelNoStore && !v.NoStore {
-			return true
-		}
-		if v.Client.Id == clientId {
-			ids = append(ids, v.Id)
-		}
-		return true
-	})
-	for _, id := range ids {
-		HttpProxyCache.Remove(id)
-		_ = file.GetDb().DelHost(id)
-	}
-}
-
-// DelClientConnect close the client
-func DelClientConnect(clientId int) {
-	Bridge.DelClient(clientId)
-}
-
-var (
-	// Cache
-	cacheMu         sync.RWMutex
-	dashboardCache  map[string]interface{}
-	lastRefresh     time.Time
-	lastFullRefresh time.Time
-
-	// Net IO
-	samplerOnce    sync.Once
-	lastBytesSent  uint64
-	lastBytesRecv  uint64
-	lastSampleTime time.Time
-	ioSendRate     atomic.Value // float64
-	ioRecvRate     atomic.Value // float64
-)
-
-func startSpeedSampler() {
-	samplerOnce.Do(func() {
-		if io1, _ := net.IOCounters(false); len(io1) > 0 {
-			lastBytesSent = io1[0].BytesSent
-			lastBytesRecv = io1[0].BytesRecv
-		}
-		lastSampleTime = time.Now()
-
-		go func() {
-			ticker := time.NewTicker(time.Second)
-			defer ticker.Stop()
-			for now := range ticker.C {
-				if io2, _ := net.IOCounters(false); len(io2) > 0 {
-					sent := io2[0].BytesSent
-					recv := io2[0].BytesRecv
-					elapsed := now.Sub(lastSampleTime).Seconds()
-
-					// calculate bytes/sec
-					rateSent := float64(sent-lastBytesSent) / elapsed
-					rateRecv := float64(recv-lastBytesRecv) / elapsed
-
-					ioSendRate.Store(rateSent)
-					ioRecvRate.Store(rateRecv)
-
-					lastBytesSent = sent
-					lastBytesRecv = recv
-					lastSampleTime = now
-				}
-			}
-		}()
-	})
-}
-
-func InitDashboardData() {
-	startSpeedSampler()
-	GetDashboardData(true)
-	//return
-}
-
-func GetDashboardData(force bool) map[string]interface{} {
-	cacheMu.RLock()
-	cached := dashboardCache
-	lastR := lastRefresh
-	lastFR := lastFullRefresh
-	cacheMu.RUnlock()
-
-	if cached != nil && !force && time.Since(lastFR) < 5*time.Second {
-		if time.Since(lastR) < 1*time.Second {
-			return cached
-		}
-
-		tcpCount := 0
-		file.GetDb().JsonDb.Clients.Range(func(key, value interface{}) bool {
-			tcpCount += int(value.(*file.Client).NowConn)
-			return true
-		})
-
-		var cpuVal interface{}
-		if cpuPercent, err := cpu.Percent(0, true); err == nil {
-			var sum float64
-			for _, v := range cpuPercent {
-				sum += v
-			}
-			if n := len(cpuPercent); n > 0 {
-				cpuVal = math.Round(sum / float64(n))
-			}
-		}
-
-		var loadVal interface{}
-		if loads, err := load.Avg(); err == nil {
-			loadVal = loads.String()
-		}
-
-		var swapVal interface{}
-		if swap, err := mem.SwapMemory(); err == nil {
-			swapVal = math.Round(swap.UsedPercent)
-		}
-
-		var virtVal interface{}
-		if vir, err := mem.VirtualMemory(); err == nil {
-			virtVal = math.Round(vir.UsedPercent)
-		}
-
-		protoVals := map[string]int64{}
-		if pcounters, err := net.ProtoCounters(nil); err == nil {
-			for _, v := range pcounters {
-				if val, ok := v.Stats["CurrEstab"]; ok {
-					protoVals[v.Protocol] = val
-				}
-			}
-		}
-		if _, ok := protoVals["tcp"]; !ok {
-			if conns, err := net.Connections("tcp"); err == nil {
-				protoVals["tcp"] = int64(len(conns))
-			}
-		}
-		if _, ok := protoVals["udp"]; !ok {
-			if conns, err := net.Connections("udp"); err == nil {
-				protoVals["udp"] = int64(len(conns))
-			}
-		}
-
-		var ioSend, ioRecv interface{}
-		if v, ok := ioSendRate.Load().(float64); ok {
-			ioSend = v
-		}
-		if v, ok := ioRecvRate.Load().(float64); ok {
-			ioRecv = v
-		}
-
-		upTime := common.GetRunTime()
-
-		now := time.Now()
-
-		cacheMu.Lock()
-		dst := dashboardCache
-		if dst == nil {
-			dst = cached
-		}
-		dst["upTime"] = upTime
-		dst["tcpCount"] = tcpCount
-		if cpuVal != nil {
-			dst["cpu"] = cpuVal
-		}
-		if loadVal != nil {
-			dst["load"] = loadVal
-		}
-		if swapVal != nil {
-			dst["swap_mem"] = swapVal
-		}
-		if virtVal != nil {
-			dst["virtual_mem"] = virtVal
-		}
-		for k, v := range protoVals {
-			dst[k] = v
-		}
-		if ioSend != nil {
-			dst["io_send"] = ioSend
-		}
-		if ioRecv != nil {
-			dst["io_recv"] = ioRecv
-		}
-		lastRefresh = now
-		cacheMu.Unlock()
-
-		return dst
-	}
-
-	data := make(map[string]interface{})
-	data["version"] = version.VERSION
-	data["minVersion"] = GetMinVersion()
-	data["hostCount"] = common.GetSyncMapLen(&file.GetDb().JsonDb.Hosts)
-	data["clientCount"] = common.GetSyncMapLen(&file.GetDb().JsonDb.Clients)
-	if beego.AppConfig.String("public_vkey") != "" { // remove public vkey
-		data["clientCount"] = data["clientCount"].(int) - 1
-	}
-
-	dealClientData()
-
-	c := 0
-	var in, out int64
-	file.GetDb().JsonDb.Clients.Range(func(key, value interface{}) bool {
-		v := value.(*file.Client)
-		if v.IsConnect {
-			c++
-		}
-		clientIn := v.Flow.InletFlow - (v.InletFlow + v.ExportFlow)
-		if clientIn < 0 {
-			clientIn = 0
-		}
-		clientOut := v.Flow.ExportFlow - (v.InletFlow + v.ExportFlow)
-		if clientOut < 0 {
-			clientOut = 0
-		}
-		in += v.InletFlow + clientIn/2
-		out += v.ExportFlow + clientOut/2
-		return true
-	})
-	data["clientOnlineCount"] = c
-	data["inletFlowCount"] = int(in)
-	data["exportFlowCount"] = int(out)
-
-	var tcpN, udpN, secretN, socks5N, p2pN, httpN int
-	file.GetDb().JsonDb.Tasks.Range(func(key, value interface{}) bool {
-		t := value.(*file.Tunnel)
-		switch t.Mode {
-		case "tcp":
-			tcpN++
-		case "socks5":
-			socks5N++
-		case "httpProxy":
-			httpN++
-		case "mixProxy":
-			if t.HttpProxy {
-				httpN++
-			}
-			if t.Socks5Proxy {
-				socks5N++
-			}
-		case "udp":
-			udpN++
-		case "p2p":
-			p2pN++
-		case "secret":
-			secretN++
-		}
-		return true
-	})
-	data["tcpC"] = tcpN
-	data["udpCount"] = udpN
-	data["socks5Count"] = socks5N
-	data["httpProxyCount"] = httpN
-	data["secretCount"] = secretN
-	data["p2pCount"] = p2pN
-
-	bridgeType := beego.AppConfig.String("bridge_type")
-	if bridgeType == "both" {
-		bridgeType = "tcp"
-	}
-	data["bridgeType"] = bridgeType
-	data["httpProxyPort"] = beego.AppConfig.String("http_proxy_port")
-	data["httpsProxyPort"] = beego.AppConfig.String("https_proxy_port")
-	data["ipLimit"] = beego.AppConfig.String("ip_limit")
-	data["flowStoreInterval"] = beego.AppConfig.String("flow_store_interval")
-	data["serverIp"] = common.GetServerIp(connection.P2pIp)
-	data["serverIpv4"] = common.GetOutboundIP().String()
-	data["serverIpv6"] = common.GetOutboundIPv6().String()
-	data["p2pIp"] = connection.P2pIp
-	data["p2pPort"] = connection.P2pPort
-	data["p2pAddr"] = common.JoinHostPort(common.GetServerIp(connection.P2pIp), strconv.Itoa(connection.P2pPort))
-	data["logLevel"] = beego.AppConfig.String("log_level")
-	data["upTime"] = common.GetRunTime()
-	data["upSecs"] = common.GetRunSecs()
-	data["startTime"] = common.GetStartTime()
-
-	tcpCount := 0
-	file.GetDb().JsonDb.Clients.Range(func(key, value interface{}) bool {
-		tcpCount += int(value.(*file.Client).NowConn)
-		return true
-	})
-	data["tcpCount"] = tcpCount
-
-	if cpuPercent, err := cpu.Percent(0, true); err == nil {
-		var cpuAll float64
-		for _, v := range cpuPercent {
-			cpuAll += v
-		}
-		if n := len(cpuPercent); n > 0 {
-			data["cpu"] = math.Round(cpuAll / float64(n))
-		}
-	}
-	if loads, err := load.Avg(); err == nil {
-		data["load"] = loads.String()
-	}
-	if swap, err := mem.SwapMemory(); err == nil {
-		data["swap_mem"] = math.Round(swap.UsedPercent)
-	}
-	if vir, err := mem.VirtualMemory(); err == nil {
-		data["virtual_mem"] = math.Round(vir.UsedPercent)
-	}
-	if pcounters, err := net.ProtoCounters(nil); err == nil {
-		for _, v := range pcounters {
-			if val, ok := v.Stats["CurrEstab"]; ok {
-				data[v.Protocol] = val
-			}
-		}
-	}
-	if _, ok := data["tcp"]; !ok {
-		if conns, err := net.Connections("tcp"); err == nil {
-			data["tcp"] = int64(len(conns))
-		}
-	}
-	if _, ok := data["udp"]; !ok {
-		if conns, err := net.Connections("udp"); err == nil {
-			data["udp"] = int64(len(conns))
-		}
-	}
-
-	if v, ok := ioSendRate.Load().(float64); ok {
-		data["io_send"] = v
-	}
-	if v, ok := ioRecvRate.Load().(float64); ok {
-		data["io_recv"] = v
-	}
-
-	// chart
-	deciles := tool.ChartDeciles()
-	for i, v := range deciles {
-		data["sys"+strconv.Itoa(i+1)] = v
-	}
-
-	now := time.Now()
-	cacheMu.Lock()
-	dashboardCache = data
-	lastRefresh = now
-	lastFullRefresh = now
-	cacheMu.Unlock()
-
-	return data
-}
-
-func GetVersion() string {
-	return version.VERSION
-}
-
-func GetMinVersion() string {
-	return version.GetMinVersion(bridge.ServerSecureMode)
-}
-
-func GetCurrentYear() int {
-	return time.Now().Year()
 }
 
 func flowSession(m time.Duration) {
